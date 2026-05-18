@@ -54,7 +54,11 @@ Evaluate whether you have enough information to answer the question well.
 Rules:
 - Only set verdict "needs_data" if you CANNOT answer without external lookup.
 - For greetings, math, general knowledge → verdict "validated".
-- For current events, unknown specific facts → verdict "needs_data".
+- For current events, bank/financial data, schedules, specific facts → verdict "needs_data".
+- Prefer specific domain tools (Deposit, Credit, Pension, Card, Admin, RealTime) over web_search when the question is about bank products or services.
+
+Available tools:
+{tools_list}
 
 GOAL: {goal}
 APPROACH: {approach}
@@ -66,8 +70,9 @@ Return ONLY valid JSON (no markdown fences):
   "confidence": <integer 0-10>,
   "verdict": "validated" or "needs_data",
   "missing": "<what is still needed, or empty string>",
-  "tool": "web_search" or "rag_search",
-  "search_query": "<exact search query, or empty string>"
+  "tool": "<exact tool name from the list above>",
+  "tool_args": {{<argument key-value pairs matching the tool's parameters, or {{"query": "..."}} for web/rag search>}},
+  "search_query": "<for web_search/rag_search only, the search query string>"
 }}"""
 
 _SYNTHESIS_SYSTEM = """\
@@ -107,24 +112,27 @@ def _parse_json(text: str) -> dict:
     return {}
 
 
-async def _llm(messages: list[dict], model: str, retries: int = 3) -> tuple[str, str]:
+async def _llm(messages: list[dict], model: str, retries: int = 3) -> tuple[str, str, int, int]:
     for attempt in range(retries + 1):
         try:
-            resp = await llm_client.chat.completions.create(model=model, messages=messages)
-            msg = resp.choices[0].message.model_dump()
-            return msg.get("content") or "", _extract_reasoning(msg)
+            resp  = await llm_client.chat.completions.create(model=model, messages=messages)
+            msg   = resp.choices[0].message.model_dump()
+            usage = resp.usage
+            ptok  = usage.prompt_tokens     if usage else 0
+            ctok  = usage.completion_tokens if usage else 0
+            return msg.get("content") or "", _extract_reasoning(msg), ptok, ctok
         except openai.InternalServerError:
             if attempt < retries:
-                wait = 4.0 * (2 ** attempt)   # 4s → 8s → 16s
+                wait = 4.0 * (2 ** attempt)
                 ui.warn(f"Xazna API unavailable — retry {attempt + 1}/{retries} in {wait:.0f}s…")
                 await asyncio.sleep(wait)
             else:
                 raise
 
 
-async def _call_tool(mcp: FastMCP, tool_name: str, query: str) -> str:
+async def _call_tool(mcp: FastMCP, tool_name: str, args: dict) -> str:
     try:
-        result = await mcp.call_tool(tool_name, {"query": query})
+        result = await mcp.call_tool(tool_name, args)
         return "".join(
             item.text if item.type == "text" else f"[{item.type}]"
             for item in result.content
@@ -133,10 +141,15 @@ async def _call_tool(mcp: FastMCP, tool_name: str, query: str) -> str:
         return f"Tool error: {e}"
 
 
-_TOOL_MAP = {
-    "web_search": "WebSearch_web_search",
-    "rag_search": "RAG_rag_search",
-}
+def _build_tools_list(schemas: list[dict]) -> str:
+    """Format tool schemas for the critique prompt."""
+    lines = []
+    for s in schemas:
+        fn = s["function"]
+        props = fn.get("parameters", {}).get("properties", {})
+        params = ", ".join(props.keys()) if props else "no params"
+        lines.append(f"  - {fn['name']}: {fn['description']} (args: {params})")
+    return "\n".join(lines)
 
 
 async def _get_tool_schemas(mcp: FastMCP) -> list[dict]:
@@ -155,12 +168,71 @@ async def _get_tool_schemas(mcp: FastMCP) -> list[dict]:
     ]
 
 
+async def _llm_stream_synthesis(
+    model: str, messages: list, tools: list, on_chunk,
+) -> tuple[dict, None]:
+    """Streaming LLM call for synthesis. Invokes on_chunk for text tokens; silently
+    accumulates tool calls. Falls back to non-streaming if streaming fails."""
+    try:
+        stream = await llm_client.chat.completions.create(
+            model=model, messages=messages, tools=tools or None, stream=True,
+        )
+        content_parts: list[str] = []
+        tool_calls_acc: dict[int, dict] = {}
+        has_tool_calls = False
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+
+            if delta.tool_calls:
+                has_tool_calls = True
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_acc[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
+
+            if delta.content:
+                content_parts.append(delta.content)
+                if not has_tool_calls:
+                    await on_chunk(delta.content)
+
+        content = "".join(content_parts)
+        tool_calls = (
+            [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            if tool_calls_acc else None
+        )
+        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, None
+
+    except Exception:
+        # Fall back to non-streaming
+        resp = await llm_client.chat.completions.create(
+            model=model, messages=messages, tools=tools or None,
+        )
+        msg = resp.choices[0].message.model_dump()
+        if msg.get("content") and not msg.get("tool_calls"):
+            await on_chunk(msg["content"])
+        return msg, resp.usage
+
+
 async def _llm_with_tools(
     messages: list[dict],
     mcp: FastMCP,
     model: str,
     max_rounds: int = 4,
     retries: int = 3,
+    stream_callback=None,
 ) -> tuple[str, str]:
     """LLM call with full tool-execution loop (mirrors System 1). Returns (content, reasoning)."""
     tools = await _get_tool_schemas(mcp)
@@ -171,20 +243,28 @@ async def _llm_with_tools(
     for rnd in range(max_rounds):
         # ── LLM call with retry ────────────────────────────────────────────────
         msg = None
-        for attempt in range(retries + 1):
-            try:
-                resp = await llm_client.chat.completions.create(
-                    model=model, messages=conversation, tools=tools,
-                )
-                msg = resp.choices[0].message.model_dump()
-                break
-            except openai.InternalServerError:
-                if attempt < retries:
-                    wait = 4.0 * (2 ** attempt)
-                    ui.warn(f"Xazna API unavailable — retry {attempt + 1}/{retries} in {wait:.0f}s…")
-                    await asyncio.sleep(wait)
-                else:
-                    raise
+        usage = None
+        if stream_callback:
+            msg, usage = await _llm_stream_synthesis(model, conversation, tools, stream_callback)
+        else:
+            for attempt in range(retries + 1):
+                try:
+                    resp  = await llm_client.chat.completions.create(
+                        model=model, messages=conversation, tools=tools,
+                    )
+                    msg   = resp.choices[0].message.model_dump()
+                    usage = resp.usage
+                    break
+                except openai.InternalServerError:
+                    if attempt < retries:
+                        wait = 4.0 * (2 ** attempt)
+                        ui.warn(f"Xazna API unavailable — retry {attempt + 1}/{retries} in {wait:.0f}s…")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+
+        if usage:
+            ui.token_usage(f"Phase 4 Synthesis round {rnd+1}", usage.prompt_tokens, usage.completion_tokens)
 
         reasoning = _extract_reasoning(msg)
         if reasoning:
@@ -208,7 +288,7 @@ async def _llm_with_tools(
             ui.tool_call(name, json.dumps(args, ensure_ascii=False))
 
             t_tool = time.perf_counter()
-            result = await _call_tool(mcp, name, args.get("query", ""))
+            result = await _call_tool(mcp, name, args)
             ui.timing(name, time.perf_counter() - t_tool)
             ui.tool_result(result)
 
@@ -230,6 +310,7 @@ async def run(
     messages: list[dict],
     mcp: FastMCP,
     model: str,
+    stream_callback=None,
 ) -> tuple[str, str]:
     """
     Returns (final_response_text, evidence_string).
@@ -245,7 +326,7 @@ async def run(
     strategy_input = _THOUGHT_SIG_PROMPT.format(query=user_query)
     ui.llm_input("Strategy prompt", f"[system] {_STRATEGY_SYSTEM}\n[user] {strategy_input}")
 
-    sig_content, sig_reasoning = await _llm(
+    sig_content, sig_reasoning, sig_ptok, sig_ctok = await _llm(
         messages=[
             {"role": "system", "content": _STRATEGY_SYSTEM},
             *messages[:-1],
@@ -255,6 +336,7 @@ async def run(
     )
 
     ui.timing("Phase 1 (Strategy LLM)", time.perf_counter() - t_phase12)
+    ui.token_usage("Phase 1 Strategy", sig_ptok, sig_ctok)
     if sig_reasoning:
         ui.reasoning_block(sig_reasoning, "Strategy Internal Reasoning")
 
@@ -277,6 +359,10 @@ async def run(
     reasoning_trace.append(f"Strategy: {sig_content}")
 
     # ══ Phase 3: Self-Critique & Plan loop ════════════════════════════════════
+    # Build tool list once — used in critique prompt so LLM knows all available tools
+    all_tool_schemas = await _get_tool_schemas(mcp)
+    tools_list_str   = _build_tools_list(all_tool_schemas)
+
     if confidence >= 8 and not needs_srch:
         ui.section("System 2 — Phase 3: Self-Critique Loop")
         ui.ok("Skipped — confidence ≥ 8 and no search needed")
@@ -292,11 +378,12 @@ async def run(
 
             critique_prompt = _CRITIQUE_PROMPT.format(
                 goal=goal, approach=approach, evidence=evidence_str,
+                tools_list=tools_list_str,
             )
             ui.llm_input(f"Critique round {rnd+1}", critique_prompt)
 
             t_crit = time.perf_counter()
-            crit_content, crit_reasoning = await _llm(
+            crit_content, crit_reasoning, crit_ptok, crit_ctok = await _llm(
                 messages=[
                     {"role": "system", "content": "Evaluate the plan. Return valid JSON only."},
                     {"role": "user", "content": critique_prompt},
@@ -304,6 +391,7 @@ async def run(
                 model=model,
             )
             ui.timing(f"Critique round {rnd+1} (LLM)", time.perf_counter() - t_crit)
+            ui.token_usage(f"Phase 3 Critique round {rnd+1}", crit_ptok, crit_ctok)
             ui.llm_output(f"Critique round {rnd+1} verdict", crit_content)
 
             if crit_reasoning:
@@ -313,39 +401,47 @@ async def run(
             verdict      = crit.get("verdict", "validated")
             crit_conf    = int(crit.get("confidence", 7))
             search_query = crit.get("search_query", "").strip()
-            tool_key     = crit.get("tool", "web_search")
+            mcp_tool     = crit.get("tool", "WebSearch_web_search").strip()
+            tool_args    = crit.get("tool_args") or {}
 
             ui.kv("Verdict",    verdict)
             ui.kv("Confidence", f"{crit_conf}/10")
             ui.kv("Missing",    crit.get("missing", "") or "—")
+            ui.kv("Tool",       mcp_tool)
 
             reasoning_trace.append(
                 f"Critique round {rnd+1}: verdict={verdict} confidence={crit_conf}"
             )
 
             # If no data needed → validate and exit loop
-            if verdict != "needs_data" or not search_query:
+            if verdict != "needs_data" or not mcp_tool:
                 if crit_conf >= 7 or verdict == "validated":
                     ui.ok("Plan validated — moving to Final Synthesis")
                     break
 
             # ── Proactive Tool Call (MCP Sandbox) ──────────────────────────────
-            if search_query:
-                mcp_tool = _TOOL_MAP.get(tool_key, "WebSearch_web_search")
+            # Use tool_args if provided by LLM; fall back to {"query": search_query}
+            if not tool_args and search_query:
+                tool_args = {"query": search_query}
+
+            if tool_args:
                 ui.stage("Proactive Tool Call → MCP Sandbox")
                 ui.kv("Tool",  mcp_tool)
-                ui.kv("Query", search_query)
-                ui.tool_call(mcp_tool, search_query)
+                ui.kv("Args",  json.dumps(tool_args, ensure_ascii=False)[:200])
+                ui.tool_call(mcp_tool, json.dumps(tool_args, ensure_ascii=False))
 
                 t_tool = time.perf_counter()
-                result = await _call_tool(mcp, mcp_tool, search_query)
+                result = await _call_tool(mcp, mcp_tool, tool_args)
                 ui.timing(mcp_tool, time.perf_counter() - t_tool)
                 ui.tool_result(result)
 
-                evidence_pieces.append(f"[{tool_key} | '{search_query}']:\n{result}")
-                reasoning_trace.append(f"Evidence via {tool_key}: {result[:200]}")
+                evidence_pieces.append(f"[{mcp_tool} | {json.dumps(tool_args)}]:\n{result}")
+                reasoning_trace.append(f"Evidence via {mcp_tool}: {result[:200]}")
+                ev_toks       = len(result) // 4
+                total_ev_toks = sum(len(p) // 4 for p in evidence_pieces)
                 ui.stage("New Evidence accumulated")
                 ui.evidence_state(evidence_pieces)
+                ui.kv("Evidence tokens", f"≈{ev_toks:,} this result  |  ≈{total_ev_toks:,} total evidence")
 
         ui.timing("Phase 3 (Critique total)", time.perf_counter() - t_phase3)
 
@@ -373,6 +469,7 @@ async def run(
         ],
         mcp=mcp,
         model=model,
+        stream_callback=stream_callback,
     )
     ui.timing("Phase 4 (Synthesis)", time.perf_counter() - t_phase4)
 

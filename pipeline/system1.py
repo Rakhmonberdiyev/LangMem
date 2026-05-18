@@ -15,13 +15,13 @@ import ui
 _RETRIES = 3
 
 
-async def _llm_call(model: str, messages: list, tools: list) -> dict:
+async def _llm_call(model: str, messages: list, tools: list) -> tuple[dict, object]:
     for attempt in range(_RETRIES + 1):
         try:
             resp = await llm_client.chat.completions.create(
                 model=model, messages=messages, tools=tools,
             )
-            return resp.choices[0].message.model_dump()
+            return resp.choices[0].message.model_dump(), resp.usage
         except openai.InternalServerError:
             if attempt < _RETRIES:
                 wait = 4.0 * (2 ** attempt)
@@ -29,6 +29,61 @@ async def _llm_call(model: str, messages: list, tools: list) -> dict:
                 await asyncio.sleep(wait)
             else:
                 raise
+
+
+async def _llm_call_stream(
+    model: str, messages: list, tools: list, on_chunk,
+) -> tuple[dict, None]:
+    """Streaming LLM call. Calls on_chunk(str) for text tokens only (skips tool calls).
+    Falls back to non-streaming and a single on_chunk call if streaming fails."""
+    try:
+        stream = await llm_client.chat.completions.create(
+            model=model, messages=messages, tools=tools or None, stream=True,
+        )
+        content_parts: list[str] = []
+        tool_calls_acc: dict[int, dict] = {}
+        has_tool_calls = False
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+
+            if delta.tool_calls:
+                has_tool_calls = True
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    if tc.id:
+                        tool_calls_acc[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_acc[idx]["function"]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
+
+            if delta.content:
+                content_parts.append(delta.content)
+                if not has_tool_calls:
+                    await on_chunk(delta.content)
+
+        content = "".join(content_parts)
+        tool_calls = (
+            [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            if tool_calls_acc else None
+        )
+        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, None
+
+    except Exception:
+        # Streaming unsupported or failed — fall back to non-streaming
+        msg, usage = await _llm_call(model, messages, tools)
+        if msg.get("content") and not msg.get("tool_calls"):
+            await on_chunk(msg["content"])
+        return msg, usage
 
 
 def _extract_reasoning(msg: dict) -> str:
@@ -58,6 +113,7 @@ async def run(
     mcp: FastMCP,
     model: str,
     max_rounds: int = 6,
+    stream_callback=None,
 ) -> tuple[str, list[dict]]:
     """
     Returns (final_response_text, new_messages_appended).
@@ -71,8 +127,13 @@ async def run(
 
     for rnd in range(max_rounds):
         t_llm = time.perf_counter()
-        msg = await _llm_call(model, conversation, tools)
+        if stream_callback:
+            msg, usage = await _llm_call_stream(model, conversation, tools, stream_callback)
+        else:
+            msg, usage = await _llm_call(model, conversation, tools)
         ui.timing(f"LLM round {rnd+1}", time.perf_counter() - t_llm)
+        if usage:
+            ui.token_usage(f"round {rnd+1}", usage.prompt_tokens, usage.completion_tokens)
 
         reasoning = _extract_reasoning(msg)
         if reasoning:

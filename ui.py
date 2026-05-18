@@ -1,11 +1,42 @@
 """Rich-based terminal UI — imported by agent.py and pipeline modules."""
 
+from contextvars import ContextVar
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.rule import Rule
 from rich.theme import Theme
 from rich.table import Table
+
+# Per-request SSE queue; set by the FastAPI handler before calling process_turn.
+_log_queue: ContextVar = ContextVar('_log_queue', default=None)
+
+# Tracks the last tool name called (for categorising tool results).
+_last_tool: ContextVar = ContextVar('_last_tool', default=None)
+
+# Per-request tool result collector: {'rag': [str, ...], 'web': [str, ...]}
+_tool_collector: ContextVar = ContextVar('_tool_collector', default=None)
+
+
+def set_log_queue(q) -> None:
+    """Attach an asyncio.Queue to capture log events for the current async task."""
+    _log_queue.set(q)
+
+
+def set_tool_collector(collector: dict) -> None:
+    """Attach a {'rag': [], 'web': []} dict to accumulate tool results."""
+    _tool_collector.set(collector)
+
+
+def _emit(**kwargs) -> None:
+    q = _log_queue.get()
+    if q is not None:
+        try:
+            q.put_nowait({"type": "log", **kwargs})
+        except Exception:
+            pass
+
 
 _theme = Theme({
     "stage":   "bold cyan",
@@ -33,6 +64,7 @@ def blank() -> None:
 
 def section(title: str) -> None:
     console.rule(f"[section] {title} [/section]", style="cyan dim")
+    _emit(level="section", text=title)
 
 
 def user_panel(text: str) -> None:
@@ -63,28 +95,59 @@ def tools_list(tools: list[dict]) -> None:
     )
 
 
+def token_usage(label: str, prompt: int, completion: int) -> None:
+    """Show exact LLM token I/O for one API call (from resp.usage)."""
+    total = prompt + completion
+    console.print(
+        f"      [label]{'🪙 Tokens':<16}[/label]  [dim]{label}[/dim]"
+        f"  in=[bold cyan]{prompt:,}[/bold cyan]"
+        f"  out=[bold green]{completion:,}[/bold green]"
+        f"  [dim]total {total:,}[/dim]"
+    )
+
+
+def token_sources(sources: dict[str, int]) -> None:
+    """Show estimated token breakdown by source (chars÷4 approximation)."""
+    total = sum(sources.values())
+    console.print(
+        f"      [label]{'🪙 Context ≈ tok':<16}[/label]"
+        f"  [dim]chars÷4[/dim]  total≈[bold yellow]{total:,}[/bold yellow]"
+    )
+    for name, count in sources.items():
+        pct = count / max(total, 1) * 100
+        console.print(
+            f"        [dim]{name:<22}[/dim]"
+            f"  [cyan]{count:>6,}[/cyan] [dim]tok  {pct:.0f}%[/dim]"
+        )
+
+
 def stage(name: str, detail: str = "") -> None:
     if detail:
         console.print(f"  [stage]▸ {name}[/stage]  [dimval]{detail}[/dimval]")
     else:
         console.print(f"  [stage]▸ {name}[/stage]")
+    _emit(level="stage", name=name, detail=detail)
 
 
 def kv(label: str, value: str, indent: int = 6) -> None:
     pad = " " * indent
     console.print(f"{pad}[label]{label:<16}[/label]  {value}")
+    _emit(level="kv", label=label, value=value)
 
 
 def ok(msg: str) -> None:
     console.print(f"  [ok]✓[/ok]  {msg}")
+    _emit(level="ok", text=msg)
 
 
 def warn(msg: str) -> None:
     console.print(f"  [warn]⚠[/warn]   {msg}")
+    _emit(level="warn", text=msg)
 
 
 def err(msg: str) -> None:
     console.print(f"  [err]✗[/err]  {msg}")
+    _emit(level="err", text=msg)
 
 
 # ── Tool calls ─────────────────────────────────────────────────────────────────
@@ -94,6 +157,8 @@ def tool_call(tool_name: str, args: str) -> None:
         f"  [tool]🔧 TOOL CALL → {tool_name}[/tool]\n"
         f"      [label]args:[/label] [query]{args[:300]}[/query]"
     )
+    _last_tool.set(tool_name)
+    _emit(level="tool_call", name=tool_name, args=args[:200])
 
 
 def tool_result(text: str) -> None:
@@ -105,6 +170,18 @@ def tool_result(text: str) -> None:
         border_style="dim cyan",
         padding=(0, 1),
     ))
+    _emit(level="tool_result", preview=text[:200])
+
+    collector  = _tool_collector.get()
+    last_full  = _last_tool.get() or ''
+    last_lower = last_full.lower()
+    if collector is not None:
+        if 'rag' in last_lower:
+            collector['rag'].append(text)
+        elif 'web' in last_lower or 'search' in last_lower:
+            collector['web'].append(text)
+        else:
+            collector['tools'].append({"name": last_full, "result": text})
 
 
 def no_tools_used() -> None:
@@ -122,6 +199,7 @@ def timing(label: str, elapsed: float) -> None:
     else:
         color = "red"
     console.print(f"      [dim]{label:<22}[/dim]  [{color}]⏱ {ms:.0f} ms[/{color}]")
+    _emit(level="timing", label=label, ms=int(ms))
 
 
 def total_time(label: str, elapsed: float) -> None:
@@ -131,6 +209,7 @@ def total_time(label: str, elapsed: float) -> None:
         f"[bold {color}]⏱  {label}: {ms:.0f} ms[/bold {color}]",
         style=f"{color} dim",
     )
+    _emit(level="total_time", label=label, ms=int(ms))
 
 
 # ── Deepthink step I/O panels ─────────────────────────────────────────────────
@@ -179,6 +258,7 @@ def session_dump(history: list[dict]) -> None:
     """Show the Redis session turns that will be sent to the LLM."""
     if not history:
         console.print("      [dim]  (empty session)[/dim]")
+        _emit(level="redis_msg", role=None, preview="(empty session)")
         return
     for msg in history:
         role = msg.get("role", "?")
@@ -188,6 +268,7 @@ def session_dump(history: list[dict]) -> None:
             preview += "…"
         color = "green" if role == "user" else "blue"
         console.print(f"      [bold {color}][{role:9}][/bold {color}]  {preview}")
+        _emit(level="redis_msg", role=role, preview=preview)
 
 
 def ltm_dump(facts: str) -> None:

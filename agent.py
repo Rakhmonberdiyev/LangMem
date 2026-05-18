@@ -39,6 +39,10 @@ import ui
 from memory.session import get_session, save_turn, get_user_docs
 from memory.ltm import search_ltm, upsert_ltm
 from tools.mcp_server import search_mcp, rag_mcp
+from tools.remote_mcp import (
+    deposit_mcp, credit_mcp, pension_mcp,
+    card_mcp, admin_mcp, realtime_mcp,
+)
 from pipeline.context_ingestion import build_messages
 from pipeline import safety
 from pipeline import system1, system2
@@ -69,14 +73,26 @@ def _wants_deepthink(text: str) -> bool:
 
 # ── Shared MCP server ──────────────────────────────────────────────────────────
 main_mcp = FastMCP("Main")
-main_mcp.mount(search_mcp, namespace="WebSearch")
-main_mcp.mount(rag_mcp,    namespace="RAG")
+main_mcp.mount(search_mcp,   namespace="WebSearch")
+main_mcp.mount(rag_mcp,      namespace="RAG")
+main_mcp.mount(deposit_mcp,  namespace="Deposit")
+main_mcp.mount(credit_mcp,   namespace="Credit")
+main_mcp.mount(pension_mcp,  namespace="Pension")
+main_mcp.mount(card_mcp,     namespace="Card")
+main_mcp.mount(admin_mcp,    namespace="Admin")
+main_mcp.mount(realtime_mcp, namespace="RealTime")
 
+
+_FALLBACK_MODEL = "/models/gemma"
 
 async def initialize() -> str:
-    """Resolve model ID from the Xazna API. Must be called once at startup."""
-    models = await config.llm_client.models.list()
-    model_id = models.data[0].id
+    """Resolve model ID from the Xazna API. Falls back to hardcoded ID if API is down."""
+    try:
+        models = await config.llm_client.models.list()
+        model_id = models.data[0].id
+    except Exception as exc:
+        model_id = _FALLBACK_MODEL
+        ui.warn(f"Could not fetch model list ({exc}) — using fallback: {model_id}")
     config.MODEL_ID = model_id
     ui.console.print(
         f"\n[dim]Model:[/dim] [bold cyan]{model_id}[/bold cyan]"
@@ -91,8 +107,15 @@ async def process_turn(
     user_input: str,
     user_id: str,
     deepthink: bool = True,
+    stream_callback=None,
+    metadata: dict | None = None,
 ) -> str:
-    """Process one user turn through the full pipeline. Returns assistant response."""
+    """Process one user turn through the full pipeline. Returns assistant response.
+
+    If metadata dict is provided it is populated in-place with:
+      ltm_facts: list[str]   — facts retrieved from Mem0 LTM
+      evidence:  str         — web/RAG evidence gathered by System 2 (if deepthink)
+    """
     model = config.MODEL_ID
 
     t_overall = time.perf_counter()
@@ -128,10 +151,29 @@ async def process_turn(
     ui.kv("Mem0 LTM facts", f"{len(ltm_facts.splitlines())} facts" if ltm_facts else "none found")
     ui.ltm_dump(ltm_facts)
 
+    if metadata is not None:
+        metadata["ltm_facts"] = [f.lstrip("- ") for f in ltm_facts.splitlines() if f.strip()]
+
     ui.kv("Uploaded docs",  ", ".join(user_docs) if user_docs else "none")
 
     messages = build_messages(user_input, session_hist, ltm_facts, user_docs=user_docs)
     ui.kv("Context window", f"{len(messages)} messages sent to LLM")
+
+    # ── Token source breakdown (approximate: chars ÷ 4) ────────────────────────
+    def _est(text: str) -> int:
+        return max(0, len(text) // 4)
+
+    sys_total_toks = _est(messages[0]["content"])
+    ltm_toks       = _est(ltm_facts) if ltm_facts else 0
+    session_toks   = sum(_est(str(m.get("content", ""))) for m in session_hist)
+    user_toks      = _est(user_input)
+    ui.token_sources({
+        "System prompt":  max(0, sys_total_toks - ltm_toks),
+        "Redis session":  session_toks,
+        "Mem0 LTM":       ltm_toks,
+        "User input":     user_toks,
+    })
+
     ui.section("Messages → LLM")
     ui.messages_dump(messages)
 
@@ -154,12 +196,16 @@ async def process_turn(
     t_system = time.perf_counter()
     if deepthink or forced:
         ui.stage("System 2", "Deepthink ON  (Strategy → Critique Loop → Synthesis)")
-        response, evidence = await system2.run(messages, main_mcp, model)
+        response, evidence = await system2.run(messages, main_mcp, model, stream_callback=stream_callback)
         ui.total_time("System 2 total", time.perf_counter() - t_system)
+        if metadata is not None:
+            metadata["evidence"] = evidence
     else:
         ui.stage("System 1", "Fast Mode  (direct tool-call loop)")
-        response, _ = await system1.run(messages, main_mcp, model)
+        response, _ = await system1.run(messages, main_mcp, model, stream_callback=stream_callback)
         ui.total_time("System 1 total", time.perf_counter() - t_system)
+        if metadata is not None:
+            metadata["evidence"] = ""
 
     # ── 4. Grounding & Hallucination Filter ────────────────────────────────────
     ui.section("Output Processing")
@@ -168,6 +214,7 @@ async def process_turn(
     response = await ground_and_filter(response, evidence, model)
     ui.timing("Grounding filter", time.perf_counter() - t_ground)
     ui.ok("Grounding complete")
+    ui.kv("🪙 Response tokens", f"≈{len(response)//4:,} tok  ({len(response):,} chars)")
 
     # ── 5. Output Safety Guard ──────────────────────────────────────────────────
     out_safe, out_reason = safety.check_output(response)

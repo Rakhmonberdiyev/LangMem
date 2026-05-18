@@ -11,9 +11,9 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
-from config import OPENAI_API_KEY, QDRANT_HOST, QDRANT_PORT, RAG_COLLECTION, EMBED_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, QDRANT_HOST, QDRANT_PORT, RAG_COLLECTION, EMBED_MODEL
 
-_embed_client = OpenAI(api_key=OPENAI_API_KEY)
+_embed_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 _qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 CHUNK_SIZE    = 800   # characters per chunk
@@ -62,7 +62,7 @@ def _ensure_collection() -> None:
     if RAG_COLLECTION not in existing:
         _qdrant.create_collection(
             collection_name=RAG_COLLECTION,
-            vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=2048, distance=Distance.COSINE),
         )
 
 
