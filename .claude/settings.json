@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python test/eval_longmemeval.py --help)",
+      "Bash(python -c \"from memory.ltm import upsert_ltm; import inspect; print\\(inspect.signature\\(upsert_ltm\\)\\)\")",
+      "Bash(pip show *)",
+      "Bash(pip install *)",
+      "Bash(git filter-repo *)",
+      "Bash(python -m git_filter_repo --version)",
+      "Bash(/Users/rakhmonberdiev/Research/MCP/.venv/bin/pip install *)",
+      "Bash(/Users/rakhmonberdiev/Research/MCP/.venv/bin/git-filter-repo --version)",
+      "Read(//tmp/gfr_install/**)",
+      "Read(//tmp/**)",
+      "Read(//private/tmp/gfr_install/**)",
+      "Bash(brew list *)",
+      "Bash(brew install *)"
+    ]
+  }
+}
