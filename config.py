@@ -125,3 +125,24 @@ QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 RAG_COLLECTION = "knowledge_base"
 EMBED_MODEL = "/models/embedding"
+
+# --- LangMem (three-tier Qdrant collections) ---
+EMBED_DIM             = 2048
+SEMANTIC_COLLECTION   = "langmem_semantic"
+EPISODIC_COLLECTION   = "langmem_episodic"
+PROCEDURAL_COLLECTION = "langmem_procedural"
+
+# Pre-create all three LangMem collections at startup
+try:
+    _qc2 = QdrantClient(host="localhost", port=6333)
+    _existing2 = {c.name for c in _qc2.get_collections().collections}
+    for _col in (SEMANTIC_COLLECTION, EPISODIC_COLLECTION, PROCEDURAL_COLLECTION):
+        if _col not in _existing2:
+            _qc2.create_collection(
+                _col,
+                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            )
+    _qc2.close()
+    del _qc2, _existing2, _col
+except Exception as _e2:
+    print(f"[config] WARNING: LangMem Qdrant collections unavailable ({_e2})")

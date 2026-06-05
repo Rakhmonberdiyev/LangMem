@@ -18,6 +18,7 @@ import html as _html
 import time as _time
 from dotenv import load_dotenv
 
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message,
@@ -103,7 +104,7 @@ _settings: dict[int, dict] = {}
 
 
 def _get_deepthink(uid: int) -> bool:
-    return _settings.setdefault(uid, {"deepthink": True})["deepthink"]
+    return _settings.setdefault(uid, {"deepthink": False})["deepthink"]
 
 
 def _set_deepthink(uid: int, val: bool) -> None:
@@ -190,13 +191,12 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     uid = message.from_user.id
-    _set_deepthink(uid, True)
+    _set_deepthink(uid, False)
     name = message.from_user.first_name or "there"
     await message.answer(
         f"👋 Hi <b>{name}</b>! I'm your AI Assistant.\n\n"
-        "🧠 <b>Deepthink</b> — I reason step-by-step, search for evidence, "
-        "then synthesize a careful answer.\n"
-        "⚡ <b>Fast</b> — Direct response with tool access, no deep reasoning.\n\n"
+        "⚡ <b>Fast</b> (default) — Direct response with tool access.\n"
+        "🧠 <b>Deepthink</b> — Step-by-step reasoning with evidence search.\n\n"
         "Just send me a message to get started!",
         reply_markup=_keyboard(uid),
     )

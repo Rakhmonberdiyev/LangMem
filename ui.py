@@ -319,3 +319,139 @@ def reasoning_block(text: str, label: str = "Reasoning") -> None:
         border_style="yellow dim",
         padding=(0, 1),
     ))
+
+
+# ── LLM Input Panel — shows every section with its source ─────────────────────
+
+def _tool_source(name: str) -> str:
+    """Infer the source label from the tool name prefix."""
+    prefix = name.split("_")[0]
+    return {
+        "Memory":    "LangMem: Qdrant langmem_semantic / episodic / procedural",
+        "RAG":       "Qdrant: knowledge_base (user uploads)",
+        "WebSearch": "Internet (DuckDuckGo)",
+        "Deposit":   "Bank MCP — Deposit service",
+        "Credit":    "Bank MCP — Credit service",
+        "Card":      "Bank MCP — Card service",
+        "Pension":   "Bank MCP — Pension service",
+        "Admin":     "Bank MCP — Admin service",
+        "RealTime":  "Bank MCP — RealTime service",
+    }.get(prefix, "MCP")
+
+
+def llm_input_panel(
+    user_id: str,
+    user_input: str,
+    messages: list[dict],
+    session_hist: list[dict],
+    user_docs: list[str],
+    ltm_facts: str,
+    procedural_rules: str,
+    tools: list[dict] | None = None,
+) -> None:
+    """Print a structured panel showing exactly what goes into the LLM and where each part comes from."""
+    SEP  = "═" * 72
+    sep2 = "─" * 72
+
+    console.print()
+    console.print(f"[bold cyan]{SEP}[/bold cyan]")
+    console.print(f"[bold cyan]  INPUT → MAIN LLM[/bold cyan]  [dim](user: {user_id})[/dim]")
+    console.print(f"[bold cyan]{SEP}[/bold cyan]")
+    console.print()
+
+    # ── Base instructions ──────────────────────────────────────────────────────
+    base = messages[0]["content"].split("\n\n## Your learned instructions")[0]
+    base = base.split("\n\n[Documents")[0].split("\n\n[Long-term memory")[0]
+    base_preview = base[:200].replace("\n", " ")
+    if len(base) > 200:
+        base_preview += "…"
+    console.print("  [bold yellow][Base instructions][/bold yellow]  [dim]← pipeline/context_ingestion.py (static)[/dim]")
+    console.print(f"    [dim]{base_preview}[/dim]")
+    console.print()
+
+    # ── Procedural Memory ─────────────────────────────────────────────────────
+    console.print("  [bold yellow][Procedural Memory][/bold yellow]  [dim]← Qdrant: langmem_procedural (deterministic load)[/dim]")
+    if procedural_rules:
+        for line in procedural_rules.splitlines()[:4]:
+            console.print(f"    [dim]{line[:120]}[/dim]")
+    else:
+        console.print("    [dim](none yet — grows as you interact)[/dim]")
+    console.print()
+
+    # ── Uploaded documents ────────────────────────────────────────────────────
+    console.print("  [bold yellow][Uploaded documents][/bold yellow]  [dim]← filenames: Redis  |  content: Qdrant knowledge_base[/dim]")
+    if user_docs:
+        for d in user_docs[:5]:
+            console.print(f"    [dim]- {d}[/dim]")
+    else:
+        console.print("    [dim](none uploaded — RAG_rag_search will return empty)[/dim]")
+    console.print()
+
+    # ── Conversation buffer ───────────────────────────────────────────────────
+    n_turns = len(session_hist) // 2
+    console.print(
+        f"  [bold yellow][Conversation buffer — last {n_turns} turn(s)][/bold yellow]"
+        f"  [dim]← Redis active session[/dim]"
+    )
+    recent = session_hist[-6:]
+    if recent:
+        for m in recent:
+            role = m.get("role", "?")
+            content = str(m.get("content", ""))[:120].replace("\n", " ")
+            color = "green" if role == "user" else "blue"
+            console.print(f"    [bold {color}][{role:9}][/bold {color}]  [dim]{content}[/dim]")
+    else:
+        console.print("    [dim](empty — new session)[/dim]")
+    console.print()
+
+    # ── Available tools ───────────────────────────────────────────────────────
+    n_tools = len(tools) if tools else 0
+    console.print(
+        f"  [bold yellow][Available tools — {n_tools} total][/bold yellow]"
+        f"  [dim]← FastMCP: main_mcp[/dim]"
+    )
+    if tools:
+        for t in tools:
+            name = t["function"]["name"]
+            src  = _tool_source(name)
+            console.print(
+                f"    [magenta]{name:<52}[/magenta]"
+                f"  [dim]← {src}[/dim]"
+            )
+    else:
+        console.print("    [dim](tool list not available)[/dim]")
+    console.print()
+
+    # ── User message ──────────────────────────────────────────────────────────
+    console.print(f"  [dim]{sep2}[/dim]")
+    console.print("  [bold green]USER MESSAGE[/bold green]  [dim]← current input[/dim]")
+    console.print(f"  [dim]{sep2}[/dim]")
+    console.print(f"  [white]{user_input}[/white]")
+    console.print()
+    console.print(f"[bold cyan]{SEP}[/bold cyan]")
+    console.print()
+
+    # ── Token breakdown ───────────────────────────────────────────────────────
+    def _est(text: str) -> int:
+        return max(0, len(text) // 4)
+
+    sys_msg = messages[0]["content"]
+    base_toks  = _est(base)
+    proc_toks  = _est(procedural_rules)
+    buf_toks   = sum(_est(str(m.get("content", ""))) for m in session_hist[-6:])
+    user_toks  = _est(user_input)
+    total_toks = _est(sys_msg) + buf_toks + user_toks
+
+    console.print(
+        f"      [bold]🪙 Context ≈ tok[/bold]   [dim]chars÷4  total≈{total_toks:,}[/dim]"
+    )
+    rows = [
+        ("System prompt (base)",  base_toks),
+        ("Procedural rules",      proc_toks),
+        ("Active buffer",         buf_toks),
+        ("User input",            user_toks),
+    ]
+    for label, toks in rows:
+        pct = f"{toks * 100 // total_toks}%" if total_toks > 0 else "0%"
+        console.print(f"        [dim]{label:<25}  {toks:>6,} tok  {pct}[/dim]")
+    console.print()

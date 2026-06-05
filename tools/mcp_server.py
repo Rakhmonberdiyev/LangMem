@@ -1,5 +1,7 @@
 """MCP tools: web_search (DuckDuckGo) and rag_search (Qdrant knowledge_base)."""
 
+import contextvars
+
 from fastmcp import FastMCP
 try:
     from ddgs import DDGS          # new package name
@@ -7,7 +9,7 @@ except ImportError:
     from duckduckgo_search import DDGS  # fallback
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, VectorParams
 
 from config import LLM_API_KEY, LLM_BASE_URL, QDRANT_HOST, QDRANT_PORT, RAG_COLLECTION, EMBED_MODEL
 
@@ -17,6 +19,14 @@ rag_mcp = FastMCP("RAG")
 
 _embed_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 _qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+# Per-request user_id binding — ensures rag_search only returns the current user's docs
+_rag_user_id: contextvars.ContextVar[str] = contextvars.ContextVar("rag_user_id", default="")
+
+
+def set_rag_context(user_id: str) -> None:
+    """Bind user_id for the current async task (called once per process_turn in agent.py)."""
+    _rag_user_id.set(user_id)
 
 
 def _ensure_rag_collection() -> bool:
@@ -64,9 +74,16 @@ def rag_search(query: str, top_k: int = 5) -> str:
         resp = _embed_client.embeddings.create(model=EMBED_MODEL, input=query)
         vector = resp.data[0].embedding
 
+        user_id = _rag_user_id.get()
+        query_filter = (
+            Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+            if user_id else None
+        )
+
         result = _qdrant.query_points(
             collection_name=RAG_COLLECTION,
             query=vector,
+            query_filter=query_filter,
             limit=top_k,
             with_payload=True,
         )

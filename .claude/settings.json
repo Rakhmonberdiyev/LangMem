@@ -14,7 +14,11 @@
       "Read(//tmp/**)",
       "Read(//private/tmp/gfr_install/**)",
       "Bash(brew list *)",
-      "Bash(brew install *)"
+      "Bash(brew install *)",
+      "Bash(pkill -f telegram_bot.py)",
+      "Bash(kill -9 7474 5997 5749 5449 7387 7216)",
+      "Bash(curl -s \"https://api.telegram.org/bot8610602481:AAGFRMJ4IwREASzZsqZQgnU1k_V-BcHbEZ8/getWebhookInfo\")",
+      "Bash(python3 -m json.tool)"
     ]
   }
 }

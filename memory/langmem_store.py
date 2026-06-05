@@ -33,6 +33,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.store.base import Item, SearchItem
 from langmem import Prompt, create_memory_store_manager, create_prompt_optimizer
+from langmem.prompts.types import AnnotatedTrajectory
 from qdrant_client import AsyncQdrantClient, QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -155,7 +156,7 @@ class QdrantLTMStore:
 
     # ── Sync operations (used by save_semantic / save_episodic) ───────────
 
-    def put(self, namespace: tuple, key: str, value: dict) -> None:
+    def put(self, namespace: tuple, key: str, value: dict, index=None, *, ttl=None) -> None:
         col    = self._collection(namespace)
         text   = _extract_text(value)
         vector = _embeddings.embed_query(text)
@@ -175,7 +176,7 @@ class QdrantLTMStore:
 
     # ── Async operations (used by LangMem managers + search functions) ────
 
-    async def aput(self, namespace: tuple, key: str, value: dict) -> None:
+    async def aput(self, namespace: tuple, key: str, value: dict, index=None, *, ttl=None) -> None:
         col    = self._collection(namespace)
         text   = _extract_text(value)
         vector = await _embeddings.aembed_query(text)
@@ -432,7 +433,7 @@ async def optimize_procedural(
     if store is None or not thread_messages:
         return
     lc_msgs    = _to_lc_messages(thread_messages)
-    trajectory = [{"messages": lc_msgs, "label": "positive"}]
+    trajectory = [AnnotatedTrajectory(messages=lc_msgs, feedback="positive")]
     base_rules = current_rules or (
         "Always call the appropriate bank tool before answering from general knowledge. "
         "Respond in the user's language (Uzbek, Russian, or English). "
