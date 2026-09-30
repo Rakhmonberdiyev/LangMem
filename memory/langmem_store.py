@@ -24,6 +24,7 @@ manage_memory is exposed via tools/langmem_mcp.py for real-time edits.
 """
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -32,8 +33,7 @@ from typing import Any, Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.store.base import Item, SearchItem
-from langmem import Prompt, create_memory_store_manager, create_prompt_optimizer
-from langmem.prompts.types import AnnotatedTrajectory
+from langmem import create_memory_store_manager
 from qdrant_client import AsyncQdrantClient, QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -284,7 +284,10 @@ def _extract_text(value: Any) -> str:
     """
     if not isinstance(value, dict):
         return str(value)
-    # LangMem format: value["content"] is a dict with a "content" key
+    # Procedural format: {"rule": "...", "version": N}
+    if "rule" in value:
+        return str(value["rule"])
+    # LangMem manager format: {"kind": "Memory", "content": {"content": "..."}}
     inner = value.get("content", value)
     if isinstance(inner, dict):
         return inner.get("content", str(inner))
@@ -297,33 +300,38 @@ _semantic_manager = create_memory_store_manager(
     _lang_model,
     namespace=("user", "{langgraph_user_id}", "semantic"),
     instructions=(
-        "Extract and store long-term facts about the user: name, age, city, job, "
-        "language preferences, goals, ongoing projects, named people and organisations, "
-        "and any persistent preferences or dislikes. "
-        "Skip greetings, filler, and one-off requests that won't be relevant in future sessions. "
-        "Consolidate and deduplicate — update existing facts rather than creating redundant entries."
-    ),
-    store=store,
-    enable_inserts=True,
-    enable_deletes=False,
-)
-
-_episodic_manager = create_memory_store_manager(
-    _lang_model,
-    namespace=("user", "{langgraph_user_id}", "episodic"),
-    instructions=(
-        "Identify high-quality, reusable interaction examples from this conversation. "
-        "Store examples where: the user asked a complex domain question and received a highly "
-        "accurate tool-grounded answer; the user gave explicit positive feedback; "
-        "or the exchange demonstrates an important reasoning pattern. "
-        "Format as a compact (user question → key facts used → concise answer) triple."
+        "Extract and store CURRENT STATE facts about the user — things that are true RIGHT NOW. "
+        "Track: name, city, job, language preference, billing address, active card type and tier, "
+        "credit limit, co-holder names, enabled features (foreign currency, SMS, autopay), income. "
+        "CRITICAL: preserve all numeric values exactly as stated (write '7,000,000 UZS' not 'seven million'). "
+        "When a fact changes, DELETE the old version — keep only the latest value per concept. "
+        "Skip greetings and pure questions that contain no new facts about the user."
     ),
     store=store,
     enable_inserts=True,
     enable_deletes=True,
 )
 
-_proc_optimizer = create_prompt_optimizer(_lang_model, kind="metaprompt")
+_episodic_manager = create_memory_store_manager(
+    _lang_model,
+    namespace=("user", "{langgraph_user_id}", "episodic"),
+    instructions=(
+        "Record WHAT HAPPENED as immutable history entries for temporal reasoning. "
+        "For every meaningful exchange store: what the user requested, what changed, before/after values. "
+        "Examples: 'Applied for Humo Classic card', 'Switched from Humo Classic to Visa Gold', "
+        "'Credit limit set to 10,000,000 UZS', 'Credit limit reduced from 10,000,000 to 7,000,000 UZS', "
+        "'Co-holder Nilufar added', 'Co-holder Nilufar removed — card is now sole-holder', "
+        "'Billing address: Toshkent, Amir Temur 12', 'Income: 5,000,000 UZS/month', "
+        "'Statement language set to Uzbek', 'Foreign currency transactions enabled'. "
+        "CRITICAL: preserve all numeric values exactly (7,000,000 not 'seven million'). "
+        "For changes always record BOTH old and new values. "
+        "NEVER delete entries — history is immutable. Skip only pure greetings."
+    ),
+    store=store,
+    enable_inserts=True,
+    enable_deletes=False,
+)
+
 
 
 # ── Message converter ─────────────────────────────────────────────────────────
@@ -349,7 +357,20 @@ async def search_semantic(query: str, user_id: str, limit: int = 5) -> list[str]
         return []
     try:
         results = await store.asearch(_semantic_ns(user_id), query=query, limit=limit)
-        return [_extract_text(item.value) for item in results if item.value]
+        ui.console.print(
+            f"      [dim cyan]Qdrant collection:[/dim cyan] [bold cyan]{SEMANTIC_COLLECTION}[/bold cyan]"
+            f"  [dim]({len(results)} hits)[/dim]"
+        )
+        texts = []
+        for item in results:
+            if not item.value:
+                continue
+            text = _extract_text(item.value)
+            score = getattr(item, "score", None)
+            score_str = f"  [dim]score={score:.3f}[/dim]" if score is not None else ""
+            ui.console.print(f"        [dim]key={item.key[:20]}[/dim]{score_str}  {text[:120]}")
+            texts.append(text)
+        return texts
     except Exception as e:
         ui.warn(f"[langmem] Semantic search error: {e}")
         return []
@@ -360,7 +381,20 @@ async def search_episodic(query: str, user_id: str, limit: int = 3) -> list[str]
         return []
     try:
         results = await store.asearch(_episodic_ns(user_id), query=query, limit=limit)
-        return [_extract_text(item.value) for item in results if item.value]
+        ui.console.print(
+            f"      [dim cyan]Qdrant collection:[/dim cyan] [bold cyan]{EPISODIC_COLLECTION}[/bold cyan]"
+            f"  [dim]({len(results)} hits)[/dim]"
+        )
+        texts = []
+        for item in results:
+            if not item.value:
+                continue
+            text = _extract_text(item.value)
+            score = getattr(item, "score", None)
+            score_str = f"  [dim]score={score:.3f}[/dim]" if score is not None else ""
+            ui.console.print(f"        [dim]key={item.key[:20]}[/dim]{score_str}  {text[:120]}")
+            texts.append(text)
+        return texts
     except Exception as e:
         ui.warn(f"[langmem] Episodic search error: {e}")
         return []
@@ -371,14 +405,16 @@ async def get_procedural_rules(user_id: str) -> str:
         return ""
     try:
         results = await store.asearch(
-            _procedural_ns(user_id), query="system instructions rules", limit=1
+            _procedural_ns(user_id), query="system instructions rules", limit=10
         )
         if results:
-            val = results[0].value
-            # Procedural rules may be stored directly {"rules": "..."} or via LangMem format
-            return (val.get("rules", "")
-                    or _extract_text(val)
-                    or "")
+            lines = []
+            for item in results:
+                val = item.value or {}
+                rule_text = val.get("rule") or val.get("rules") or _extract_text(val)
+                if rule_text:
+                    lines.append(rule_text)
+            return "\n".join(lines)
     except Exception:
         pass
     return ""
@@ -389,8 +425,8 @@ async def get_procedural_rules(user_id: str) -> str:
 def save_semantic(user_id: str, content: str, key: str | None = None) -> str:
     if store is None:
         return key or "no_store"
-    k = key or f"fact_{uuid.uuid4().hex[:12]}"
-    # LangMem expects {"kind": "Memory", "content": {"content": "..."}}
+    # Deterministic key: same content → same Qdrant point → upsert overwrites instead of duplicating
+    k = key or "fact_" + hashlib.sha1(content.encode()).hexdigest()[:12]
     store.put(_semantic_ns(user_id), k, {"kind": "Memory", "content": {"content": content}})
     return k
 
@@ -398,7 +434,8 @@ def save_semantic(user_id: str, content: str, key: str | None = None) -> str:
 def save_episodic(user_id: str, content: str, key: str | None = None) -> str:
     if store is None:
         return key or "no_store"
-    k = key or f"ep_{uuid.uuid4().hex[:12]}"
+    # Deterministic key: same content → same Qdrant point → upsert overwrites instead of duplicating
+    k = key or "ep_" + hashlib.sha1(content.encode()).hexdigest()[:12]
     store.put(_episodic_ns(user_id), k, {"kind": "Memory", "content": {"content": content}})
     return k
 
@@ -408,21 +445,36 @@ def save_episodic(user_id: str, content: str, key: str | None = None) -> str:
 async def background_update(messages: list[dict], user_id: str) -> None:
     if store is None or not messages:
         return
-    lc_msgs = _to_lc_messages(messages)
+
+    # Prepend current UTC timestamp so episodic manager can record WHEN events happened
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    timestamped = [{"role": "system", "content": f"Current timestamp: {now_str}"}] + messages
+
+    lc_msgs = _to_lc_messages(timestamped)
     if not lc_msgs:
         return
     cfg = {"configurable": {"langgraph_user_id": user_id}}
+
     try:
         await _semantic_manager.ainvoke({"messages": lc_msgs}, config=cfg)
-        ui.console.print("[dim]  🧠 LangMem Semantic: consolidated[/dim]")
+        ui.console.print("[dim]  🧠 LangMem Semantic: facts updated[/dim]")
     except Exception as e:
         ui.warn(f"[langmem] Semantic manager error (non-fatal): {e}")
-    if len(lc_msgs) >= 6:
+
+    # Episodic runs for any real exchange (≥2 messages = at least one user+assistant turn)
+    if len(messages) >= 2:
         try:
             await _episodic_manager.ainvoke({"messages": lc_msgs}, config=cfg)
-            ui.console.print("[dim]  📚 LangMem Episodic: distilled[/dim]")
+            ui.console.print("[dim]  📚 LangMem Episodic: event recorded[/dim]")
         except Exception as e:
             ui.warn(f"[langmem] Episodic manager error (non-fatal): {e}")
+
+
+_PROC_SYSTEM = (
+    "You are improving an AI assistant's behavior rules based on observed conversations. "
+    "Analyze the conversation below and produce an improved set of rules. "
+    "Return ONLY the updated rules text — no headers, no explanation, no preamble."
+)
 
 
 async def optimize_procedural(
@@ -430,26 +482,50 @@ async def optimize_procedural(
     user_id: str,
     current_rules: str = "",
 ) -> None:
+    """
+    Improve per-user procedural rules using a direct LLM call (no tool calling required).
+    Called every 5 turns by agent.py:_persist.
+    """
     if store is None or not thread_messages:
         return
-    lc_msgs    = _to_lc_messages(thread_messages)
-    trajectory = [AnnotatedTrajectory(messages=lc_msgs, feedback="positive")]
+
     base_rules = current_rules or (
         "Always call the appropriate bank tool before answering from general knowledge. "
         "Respond in the user's language (Uzbek, Russian, or English). "
         "Be concise, factual, and grounded in tool results."
     )
+
+    lc_msgs    = _to_lc_messages(thread_messages)
+    convo_text = "\n".join(
+        f"{m.__class__.__name__.replace('Message', '')}: {m.content}"
+        for m in lc_msgs
+        if hasattr(m, "content") and m.content
+    )
+    if not convo_text.strip():
+        return
+
+    prompt_text = (
+        f"Current rules:\n{base_rules}\n\n"
+        f"Recent conversation:\n{convo_text}\n\n"
+        "Write improved rules that address any issues. Keep them concise and actionable."
+    )
+
     try:
-        new_rules = await _proc_optimizer.ainvoke({
-            "trajectories": trajectory,
-            "prompt": Prompt(name="system_rules", prompt=base_rules),
-        })
-        if isinstance(new_rules, str) and new_rules.strip():
+        response = await _lang_model.ainvoke([
+            {"role": "system", "content": _PROC_SYSTEM},
+            {"role": "user",   "content": prompt_text},
+        ])
+        rule_text = (response.content if hasattr(response, "content") else str(response)).strip()
+        if rule_text:
             await store.aput(
                 _procedural_ns(user_id),
-                "rules",
-                {"rules": new_rules.strip(), "content": new_rules.strip()},
+                "system_rules",
+                {
+                    "rule":    rule_text,
+                    "version": int(datetime.now(timezone.utc).timestamp()),
+                },
             )
             ui.console.print("[dim]  ⚙️  LangMem Procedural: rules updated[/dim]")
     except Exception as e:
-        ui.warn(f"[langmem] Procedural optimizer error (non-fatal): {e}")
+        import traceback
+        ui.warn(f"[langmem] Procedural optimizer error:\n{traceback.format_exc()}")

@@ -1,6 +1,6 @@
 """FastAPI web server for the AI Agent Dashboard.
 
-Shares the same Redis (STM) and Mem0 (LTM) instances as the Telegram bot.
+Shares the same Redis (session) and LangMem (long-term memory) instances as the Telegram bot.
 
 Run from the project root:
     uvicorn Web.backend.main:app --reload --port 8000

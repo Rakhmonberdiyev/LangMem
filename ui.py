@@ -76,9 +76,17 @@ def user_panel(text: str) -> None:
     ))
 
 
+def _strip_md(text: str) -> str:
+    """Remove markdown bold/italic markers so terminal output is clean."""
+    import re
+    text = re.sub(r'\*{1,3}', '', text)   # *** ** *
+    text = re.sub(r'_{1,3}', '', text)    # ___ __ _
+    return text
+
+
 def response_panel(text: str) -> None:
     console.print(Panel(
-        Text(text, style="white"),
+        Text(_strip_md(text), style="white"),
         title="[bot]🤖  Assistant[/bot]",
         border_style="blue",
         padding=(0, 2),
@@ -165,9 +173,9 @@ def tool_result(text: str) -> None:
     preview = text[:1500]
     suffix = f"\n[dim]…+{len(text)-1500} chars truncated[/dim]" if len(text) > 1500 else ""
     console.print(Panel(
-        Text(preview + suffix, style="dim"),
-        title="[dim]↳ TOOL RESULT (sent back to LLM)[/dim]",
-        border_style="dim cyan",
+        Text(preview + suffix, style="white"),
+        title="[cyan]↳ TOOL RESULT[/cyan]",
+        border_style="cyan",
         padding=(0, 1),
     ))
     _emit(level="tool_result", preview=text[:200])
@@ -271,14 +279,6 @@ def session_dump(history: list[dict]) -> None:
         _emit(level="redis_msg", role=role, preview=preview)
 
 
-def ltm_dump(facts: str) -> None:
-    """Show the Mem0 long-term memory facts injected into context."""
-    if not facts:
-        console.print("      [dim]  (no LTM facts)[/dim]")
-        return
-    for line in facts.splitlines():
-        console.print(f"      [yellow]•[/yellow] {line.lstrip('- ')}")
-
 
 def messages_dump(messages: list[dict]) -> None:
     """Show the exact messages array going into the LLM."""
@@ -300,11 +300,6 @@ def save_redis(user_input: str, response: str) -> None:
     console.print(f"      [bold green][user     ][/bold green]  {u}")
     console.print(f"      [bold blue][assistant][/bold blue]  {r}")
 
-
-def save_mem0(user_input: str, response: str) -> None:
-    """Show what text is being upserted to Mem0 LTM."""
-    combined = f"User: {user_input[:120]}  |  Assistant: {response[:120]}"
-    console.print(f"      [yellow]{combined.replace(chr(10), ' ')}[/yellow]")
 
 
 # ── Reasoning block ────────────────────────────────────────────────────────────
@@ -345,7 +340,6 @@ def llm_input_panel(
     messages: list[dict],
     session_hist: list[dict],
     user_docs: list[str],
-    ltm_facts: str,
     procedural_rules: str,
     tools: list[dict] | None = None,
 ) -> None:
@@ -362,18 +356,16 @@ def llm_input_panel(
     # ── Base instructions ──────────────────────────────────────────────────────
     base = messages[0]["content"].split("\n\n## Your learned instructions")[0]
     base = base.split("\n\n[Documents")[0].split("\n\n[Long-term memory")[0]
-    base_preview = base[:200].replace("\n", " ")
-    if len(base) > 200:
-        base_preview += "…"
     console.print("  [bold yellow][Base instructions][/bold yellow]  [dim]← pipeline/context_ingestion.py (static)[/dim]")
-    console.print(f"    [dim]{base_preview}[/dim]")
+    for line in base.splitlines():
+        console.print(f"    [dim]{line}[/dim]")
     console.print()
 
     # ── Procedural Memory ─────────────────────────────────────────────────────
     console.print("  [bold yellow][Procedural Memory][/bold yellow]  [dim]← Qdrant: langmem_procedural (deterministic load)[/dim]")
     if procedural_rules:
-        for line in procedural_rules.splitlines()[:4]:
-            console.print(f"    [dim]{line[:120]}[/dim]")
+        for line in procedural_rules.splitlines():
+            console.print(f"    [dim]{line}[/dim]")
     else:
         console.print("    [dim](none yet — grows as you interact)[/dim]")
     console.print()

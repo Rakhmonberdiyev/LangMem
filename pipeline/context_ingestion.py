@@ -11,7 +11,9 @@ def _system_prompt() -> str:
 ## HARD RULES — follow these before doing anything else
 1. For ANY question about pension dates, deposit rates, credit terms, card info, exchange rates, or branch details → call the relevant bank tool FIRST. Do NOT answer from memory or training data. Your training data about Uzbek bank products is outdated and unreliable.
 2. For questions about uploaded files/documents → call RAG_rag_search FIRST.
-3. Only answer directly (no tool) for: greetings, general knowledge, math, opinions, or topics clearly unrelated to bank data.
+3. For ANY question that could benefit from knowing the user — their name, job, field of study, goals, preferences, past statements, hobbies, likes/dislikes, location, or background — call Memory_search FIRST. This includes: recommendations ("what do you suggest?"), comparisons, advice ("what should I do?"), and follow-up questions in an ongoing topic. Never give a generic answer when a personalized one is possible — always check memory first.
+4. Only answer directly (no tool) for: pure greetings ("salom", "hello"), pure math, or topics that are completely new and have absolutely no personal or bank context.
+5. NEVER state or imply a personal fact about the user (age, name, job, income, location, etc.) unless it came from: (a) the user's own words in THIS conversation, or (b) Memory_search results. If you are not certain — say "I don't have that information" instead of guessing.
 
 ---
 
@@ -21,8 +23,7 @@ Current date: {date_str}  |  Current time: {time_str} (UTC+5 Tashkent)
 ## Tools you have
 
 ### Memory tools (call these to recall what you know about this user)
-- **Memory_semantic_search(query)**: Search Semantic Memory — user facts, preferences, profile details stored from previous sessions. Call when the user asks about themselves or references something they told you before.
-- **Memory_episodic_search(query)**: Search Episodic Memory — past interaction examples. Call when a similar question was handled before and you want to recall how.
+- **Memory_search(query)**: Search ALL long-term memory in one call — both user facts (Semantic: name, job, field, goals, preferences) and past interaction history (Episodic: what was discussed before). **MUST call** when: giving advice or recommendations, user references personal info, you need context about who this user is, or a follow-up question continues a previous topic. Never give a generic answer when memory could personalize it.
 - **Memory_save(content, namespace)**: Save an important fact or interaction to memory (namespace: "semantic" or "episodic").
 - **Memory_get_rules()**: Read the current Procedural Memory — evolved system instruction rules for this user.
 
@@ -67,9 +68,6 @@ def build_messages(
     """
     sys_content = _system_prompt()
 
-    if procedural_rules:
-        sys_content += f"\n\n## Your learned instructions for this user\n{procedural_rules}"
-
     if user_docs:
         doc_list = "\n".join(f"  - {d}" for d in user_docs)
         sys_content += (
@@ -80,6 +78,15 @@ def build_messages(
         )
 
     messages: list[dict] = [{"role": "system", "content": sys_content}]
+
+    # Procedural rules — loaded fresh from Qdrant each turn, injected as a separate
+    # system message so the base system prompt stays clean and rules update independently
+    if procedural_rules:
+        messages.append({
+            "role": "system",
+            "content": f"[Behavioral rules learned for this user — loaded from memory]\n{procedural_rules}",
+        })
+
     messages.extend(session_history[-20:])
     messages.append({"role": "user", "content": user_input})
     return messages

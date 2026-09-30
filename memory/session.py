@@ -9,14 +9,9 @@ from config import REDIS_HOST, REDIS_PORT, MAX_SESSION_MESSAGES
 
 _redis: aioredis.Redis | None = None
 
-# TTLs
-_HISTORY_TTL = 30 * 86400   # 30 days — individual session history
-_META_TTL    = 90 * 86400   # 90 days — sessions list + current pointer
-MAX_SESSIONS = 20            # max sessions kept per user
-
-# Docs
-_DOCS_TTL = 30 * 86400
-_MAX_DOCS  = 10
+MAX_SESSIONS = 20   # max sessions kept per user
+ACTIVE_TURNS = 20   # turn-pairs visible to the LLM in the active buffer (patchable by tests)
+_MAX_DOCS    = 10
 
 
 async def _get_redis() -> aioredis.Redis:
@@ -63,8 +58,8 @@ async def create_session(user_id: str, title: str = "New Session") -> str:
             await r.delete(f"history:{user_id}:{old['id']}")
         sessions = sessions[:MAX_SESSIONS]
 
-    await r.setex(f"sessions:{user_id}",        _META_TTL, json.dumps(sessions))
-    await r.setex(f"current_session:{user_id}", _META_TTL, sid)
+    await r.set(f"sessions:{user_id}",        json.dumps(sessions))
+    await r.set(f"current_session:{user_id}", sid)
     return sid
 
 
@@ -77,7 +72,7 @@ async def switch_session(user_id: str, session_id: str) -> bool:
     if not any(s["id"] == session_id for s in sessions):
         return False
     r = await _get_redis()
-    await r.setex(f"current_session:{user_id}", _META_TTL, session_id)
+    await r.set(f"current_session:{user_id}", session_id)
     return True
 
 
@@ -98,11 +93,12 @@ async def get_current_session_meta(user_id: str) -> dict | None:
 # ── History access (public API used by agent.py — signatures unchanged) ────────
 
 async def get_session(user_id: str) -> list[dict]:
-    """Return message history for the active session."""
+    """Return message history for the active session, trimmed to ACTIVE_TURNS turn-pairs."""
     sid  = await get_current_session_id(user_id)
     r    = await _get_redis()
     data = await r.get(f"history:{user_id}:{sid}")
-    return json.loads(data) if data else []
+    history = json.loads(data) if data else []
+    return history[-(ACTIVE_TURNS * 2):]
 
 
 async def save_turn(user_id: str, user_msg: str, assistant_msg: str) -> None:
@@ -117,17 +113,17 @@ async def save_turn(user_id: str, user_msg: str, assistant_msg: str) -> None:
     history.append({"role": "assistant", "content": assistant_msg})
     if len(history) > MAX_SESSION_MESSAGES:
         history = history[-MAX_SESSION_MESSAGES:]
-    await r.setex(key, _HISTORY_TTL, json.dumps(history))
+    await r.set(key, json.dumps(history))
 
     # Update title from first user message + message count
     sessions = await get_sessions_list(user_id)
     for s in sessions:
         if s["id"] == sid:
-            s["message_count"] = len(history) // 2
+            s["message_count"] = s.get("message_count", 0) + 1  # always increments, never capped by trim
             if s.get("title") in ("New Session", "") and user_msg.strip():
                 s["title"] = user_msg.strip()[:40]
             break
-    await r.setex(f"sessions:{user_id}", _META_TTL, json.dumps(sessions))
+    await r.set(f"sessions:{user_id}", json.dumps(sessions))
 
 
 async def get_session_history(user_id: str, session_id: str) -> list[dict]:
@@ -148,10 +144,10 @@ async def clear_session(user_id: str) -> None:
         if s["id"] == sid:
             s["message_count"] = 0
             break
-    await r.setex(f"sessions:{user_id}", _META_TTL, json.dumps(sessions))
+    await r.set(f"sessions:{user_id}", json.dumps(sessions))
 
 
-# ── Per-user uploaded document tracking (unchanged) ───────────────────────────
+# ── Per-user uploaded document tracking ───────────────────────────────────────
 
 async def get_user_docs(user_id: str) -> list[str]:
     """Return filenames uploaded by this user, most recent first."""
@@ -166,4 +162,3 @@ async def add_user_doc(user_id: str, filename: str) -> None:
     key = f"docs:{user_id}"
     await r.lpush(key, filename)
     await r.ltrim(key, 0, _MAX_DOCS - 1)
-    await r.expire(key, _DOCS_TTL)

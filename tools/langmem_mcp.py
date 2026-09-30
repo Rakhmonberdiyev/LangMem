@@ -1,12 +1,10 @@
 """
 tools/langmem_mcp.py — LangMem Memory Tools for the Main LLM Orchestrator.
 
-Four hot-path tools the LLM calls during reasoning:
+Three hot-path tools — mounted under namespace "Memory" so final names are:
 
-  Memory_semantic_search(query)   → search Semantic Memory (user facts & preferences)
-                                    Qdrant: langmem_semantic
-  Memory_episodic_search(query)   → search Episodic Memory (past interaction examples)
-                                    Qdrant: langmem_episodic
+  Memory_search(query)          → search BOTH Semantic + Episodic Memory in parallel
+                                    Qdrant: langmem_semantic + langmem_episodic
   Memory_save(content, namespace) → write to Semantic or Episodic tier
                                     Qdrant: langmem_semantic / langmem_episodic
   Memory_get_rules()              → read Procedural Memory (evolved system rules)
@@ -16,6 +14,7 @@ The current user_id is bound per-request via set_langmem_context(),
 called at the start of process_turn() in agent.py.
 """
 
+import asyncio
 import contextvars
 
 from fastmcp import FastMCP
@@ -40,43 +39,37 @@ langmem_mcp = FastMCP("LangMemMemory")
 
 
 @langmem_mcp.tool()
-async def Memory_semantic_search(query: str) -> str:
+async def search(query: str) -> str:
     """
-    Search Semantic Memory for stored user facts, preferences, and personal details.
-    Qdrant collection: langmem_semantic.
-    Use when the user references personal information, preferences, or profile details
-    from previous sessions (name, job, language, city, goals, etc.).
-    """
-    user_id = _ctx_user_id.get()
-    if not user_id:
-        return "Memory unavailable (no user context)."
-
-    facts = await search_semantic(query, user_id, limit=5)
-    if not facts:
-        return "No relevant facts found in Semantic Memory."
-    return "\n".join(f"- {f}" for f in facts)
-
-
-@langmem_mcp.tool()
-async def Memory_episodic_search(query: str) -> str:
-    """
-    Search Episodic Memory for past interaction examples relevant to this query.
-    Qdrant collection: langmem_episodic.
-    Use when you need to recall how a similar question was handled in a past session,
-    find a relevant few-shot example, or understand the user's prior interaction patterns.
+    Search long-term memory for anything relevant to the query.
+    Always searches BOTH tiers in parallel:
+      - Semantic Memory (langmem_semantic): user facts, preferences, personal details
+      - Episodic Memory (langmem_episodic): past interaction examples, how questions were handled
+    Use whenever the user references anything from previous sessions.
     """
     user_id = _ctx_user_id.get()
     if not user_id:
         return "Memory unavailable (no user context)."
 
-    examples = await search_episodic(query, user_id, limit=3)
-    if not examples:
-        return "No relevant interaction examples found in Episodic Memory."
-    return "\n".join(f"• {ex}" for ex in examples)
+    facts, examples = await asyncio.gather(
+        search_semantic(query, user_id, limit=5),
+        search_episodic(query, user_id, limit=3),
+    )
+
+    parts: list[str] = []
+    if facts:
+        parts.append("[Semantic Memory — user facts]")
+        parts.extend(f"- {f}" for f in facts)
+    if examples:
+        parts.append("[Episodic Memory — past interactions]")
+        parts.extend(f"• {ex}" for ex in examples)
+    if not parts:
+        return "No relevant memory found."
+    return "\n".join(parts)
 
 
 @langmem_mcp.tool()
-async def Memory_save(content: str, namespace: str = "semantic") -> str:
+async def save(content: str, namespace: str = "semantic") -> str:
     """
     Save an important fact or interaction example to LangMem Memory.
     - namespace='semantic'  (default): user fact, preference, or personal detail
@@ -98,7 +91,7 @@ async def Memory_save(content: str, namespace: str = "semantic") -> str:
 
 
 @langmem_mcp.tool()
-async def Memory_get_rules() -> str:
+async def get_rules() -> str:
     """
     Read the current Procedural Memory — evolved system instruction rules.
     Qdrant collection: langmem_procedural.
